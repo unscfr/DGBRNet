@@ -1,0 +1,576 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from thop import profile
+
+from models.smt import smt_s, smt_t
+
+class ConvBNAct(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        act=True,
+        dilation=1,
+        groups=1,
+    ):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+def _depthwise_filter(x, kernel):
+
+    c = x.shape[1]
+    weight = kernel.to(device=x.device, dtype=x.dtype).repeat(c, 1, 1, 1)
+    return F.conv2d(x, weight, padding=1, groups=c)
+
+class DiffGuidedFusion(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.diff_conv = ConvBNAct(channels, channels, 3, 1, 1, True)
+
+        self.attention = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid()
+        )
+
+        self.fuse = ConvBNAct(channels * 2, channels, 3, 1, 1, True)
+
+    def forward(self, low_feat, high_feat):
+        high_feat = F.interpolate(high_feat, size=low_feat.shape[2:], mode='bilinear', align_corners=False)
+
+        diff = torch.abs(low_feat - high_feat)
+        diff = self.diff_conv(diff)
+
+        att = self.attention(diff)
+        low_enhanced = low_feat * att + low_feat
+
+        out = torch.cat([low_enhanced, high_feat], dim=1)
+        out = self.fuse(out)
+        return out
+
+
+class BoundaryEnhancement(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.register_buffer("sobel_x", torch.tensor([
+            [[-1., 0., 1.],
+             [-2., 0., 2.],
+             [-1., 0., 1.]]
+        ]).view(1, 1, 3, 3))
+
+        self.register_buffer("sobel_y", torch.tensor([
+            [[-1., -2., -1.],
+             [ 0.,  0.,  0.],
+             [ 1.,  2.,  1.]]
+        ]).view(1, 1, 3, 3))
+
+        self.register_buffer("laplacian", torch.tensor([
+            [[ 0.,  1.,  0.],
+             [ 1., -4.,  1.],
+             [ 0.,  1.,  0.]]
+        ]).view(1, 1, 3, 3))
+
+        self.avg_pool = nn.AvgPool2d(3, stride=1, padding=1)
+
+        self.attention = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        self.fuse = ConvBNAct(channels, channels, 3, 1, 1, True)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        edge_x = _depthwise_filter(x, self.sobel_x)
+        edge_y = _depthwise_filter(x, self.sobel_y)
+        lap = _depthwise_filter(x, self.laplacian)
+
+        edge = torch.sqrt(edge_x * edge_x + edge_y * edge_y + 1e-6)
+        edge = edge + 0.5 * lap.abs()
+        edge = edge + self.avg_pool(edge)
+
+        att = self.attention(torch.cat([x, edge], dim=1))
+        out = x + self.gamma * (x * att + edge * att)
+        out = self.fuse(out)
+        return out
+
+
+class UncertaintyGuidance(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.uncertainty_conv = nn.Sequential(
+            nn.Conv2d(2, channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid()
+        )
+
+        self.fuse = ConvBNAct(channels, channels, 3, 1, 1)
+
+    def forward(self, feat, pred):
+        prob = torch.sigmoid(pred)
+        prob = F.interpolate(prob, size=feat.shape[2:], mode='bilinear', align_corners=False)
+
+        confidence = 1.0 - torch.abs(prob - 0.5) * 2.0
+        confidence = torch.clamp(confidence, 0.0, 1.0)
+        uncertainty = 1.0 - confidence
+
+        guide = torch.cat([confidence, uncertainty], dim=1)
+        guide = self.uncertainty_conv(guide)
+
+        out = feat * (1.0 + guide) + feat
+        out = self.fuse(out)
+        return out
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        return self.net(torch.cat([avg_out, max_out], dim=1))
+
+class SemanticContextBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.branch1 = ConvBNAct(channels, channels, 3, 1, 1, True, dilation=1)
+        self.branch2 = ConvBNAct(channels, channels, 3, 1, 2, True, dilation=2)
+        self.branch3 = ConvBNAct(channels, channels, 3, 1, 3, True, dilation=3)
+
+        self.fuse = ConvBNAct(channels * 3, channels, 1, 1, 0, True)
+
+        self.channel_att = ChannelAttention(channels, reduction=4)
+        self.spatial_att = SpatialAttention(kernel_size=7)
+
+        self.out_proj = ConvBNAct(channels, channels, 3, 1, 1, True)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        ctx1 = self.branch1(x)
+        ctx2 = self.branch2(x)
+        ctx3 = self.branch3(x)
+
+        ctx = self.fuse(torch.cat([ctx1, ctx2, ctx3], dim=1))
+
+        ca = self.channel_att(ctx)
+        sa = self.spatial_att(ctx)
+        gate = ca * sa
+
+        out = x + self.gamma * ctx * gate
+        out = self.out_proj(out)
+        return out
+
+class BoundaryContextBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.register_buffer("sobel_x", torch.tensor([
+            [[-1., 0., 1.],
+             [-2., 0., 2.],
+             [-1., 0., 1.]]
+        ]).view(1, 1, 3, 3))
+
+        self.register_buffer("sobel_y", torch.tensor([
+            [[-1., -2., -1.],
+             [ 0.,  0.,  0.],
+             [ 1.,  2.,  1.]]
+        ]).view(1, 1, 3, 3))
+
+        self.register_buffer("laplacian", torch.tensor([
+            [[ 0.,  1.,  0.],
+             [ 1., -4.,  1.],
+             [ 0.,  1.,  0.]]
+        ]).view(1, 1, 3, 3))
+
+        self.pool = nn.AvgPool2d(3, stride=1, padding=1)
+
+        self.edge_mix = ConvBNAct(channels * 3, channels, 1, 1, 0, True)
+
+        self.gate = nn.Sequential(
+            ConvBNAct(channels * 2, channels, 3, 1, 1, True),
+            nn.Conv2d(channels, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        self.fuse = ConvBNAct(channels, channels, 3, 1, 1, True)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        gx = _depthwise_filter(x, self.sobel_x)
+        gy = _depthwise_filter(x, self.sobel_y)
+        lap = _depthwise_filter(x, self.laplacian)
+
+        grad = torch.sqrt(gx * gx + gy * gy + 1e-6)
+        lap = lap.abs()
+
+        edge = self.edge_mix(torch.cat([grad, lap, self.pool(grad)], dim=1))
+        gate = self.gate(torch.cat([x, edge], dim=1))
+
+        out = x + self.gamma * edge * gate
+        out = self.fuse(out)
+        return out
+
+class ConfidenceFeedbackRefiner(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.guide_encoder = nn.Sequential(
+            nn.Conv2d(3, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True)
+        )
+
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        self.fuse = ConvBNAct(channels + 1, channels, 3, 1, 1, True)
+        self.delta = ConvBNAct(channels, channels, 3, 1, 1, True)
+        self.pred_head = nn.Conv2d(channels, 1, 3, padding=1)
+
+        self.avg_pool = nn.AvgPool2d(3, stride=1, padding=1)
+
+    def forward(self, feat, pred):
+        print(feat.shape, pred.shape)
+        pred_up = F.interpolate(pred, size=feat.shape[2:], mode='bilinear', align_corners=False)
+        prob = torch.sigmoid(pred_up)
+
+        eps = 1e-6
+        confidence = 1.0 - torch.abs(prob - 0.5) * 2.0
+        confidence = torch.clamp(confidence, 0.0, 1.0)
+        uncertainty = 1.0 - confidence
+
+        entropy = -(prob * torch.log(prob + eps) + (1.0 - prob) * torch.log(1.0 - prob + eps))
+        entropy = entropy / torch.log(torch.tensor(2.0, device=entropy.device, dtype=entropy.dtype))
+        entropy = torch.clamp(entropy, 0.0, 1.0)
+
+        boundary_hint = torch.abs(prob - self.avg_pool(prob))
+        boundary_hint = torch.clamp(boundary_hint, 0.0, 1.0)
+
+        guide = torch.cat([confidence, uncertainty, boundary_hint], dim=1)
+        guide_feat = self.guide_encoder(guide)
+
+        gate = self.gate(torch.cat([feat, guide_feat], dim=1))
+        feat = feat * (1.0 + gate) + guide_feat
+
+        x = self.fuse(torch.cat([feat, pred_up], dim=1))
+        delta = self.delta(x)
+        out_feat = feat + delta
+
+        pred_res = self.pred_head(out_feat)
+        new_pred = pred_up + pred_res
+
+        return out_feat, new_pred
+
+
+class LogitFusionHead(nn.Module):
+    def __init__(self, in_channels=3, hidden=16):
+        super().__init__()
+
+        self.weight_net = nn.Sequential(
+            nn.Conv2d(5, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 3, 1, bias=True)
+        )
+
+        # 输入: fused logit + mean + var + disagreement = 4 通道
+        self.refine = nn.Sequential(
+            nn.Conv2d(4, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True)
+        )
+
+        self.out = nn.Conv2d(hidden, 1, 1, bias=True)
+
+    def forward(self, out1, out2, out3):
+        stack = torch.cat([out1, out2, out3], dim=1)  # [B,3,H,W]
+        mean = torch.mean(stack, dim=1, keepdim=True)
+        var = torch.var(stack, dim=1, keepdim=True, unbiased=False)
+
+        weight_input = torch.cat([stack, mean, var], dim=1)  # 5 通道
+        weights = self.weight_net(weight_input)
+        weights = torch.softmax(weights, dim=1)
+
+        fused = weights[:, 0:1] * out1 + weights[:, 1:2] * out2 + weights[:, 2:3] * out3
+
+        disagreement = (
+            torch.abs(out1 - fused) +
+            torch.abs(out2 - fused) +
+            torch.abs(out3 - fused)
+        )
+
+        feat = torch.cat([fused, mean, var, disagreement], dim=1)
+        feat = self.refine(feat)
+
+        residual = self.out(feat)
+        return residual
+
+class SpatialPropagation(nn.Module):
+    def __init__(self, channels, r=4):
+        super().__init__()
+        mid = channels * r
+
+        # expand (CBR with depthwise)
+        self.expand = nn.Sequential(
+            nn.Conv2d(channels, mid, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+
+        # compress (CB)
+        self.compress = nn.Sequential(
+            nn.Conv2d(mid, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, Ei, Fi, Fj):
+        # residual from original pair
+        Fi = F.interpolate(Fi, size=Fj.shape[2:], mode="bilinear", align_corners=False)
+        res = Fi + Fj
+
+        x = self.expand(Ei)
+        x = self.compress(x)
+
+        return x + res
+
+class GID(nn.Module):
+    def __init__(self, channel, r=4):
+        super().__init__()
+
+        self.sp1 = SpatialPropagation(channel, r)
+        self.sp2 = SpatialPropagation(channel, r)
+        self.sp3 = SpatialPropagation(channel, r)
+
+        self.out_conv = ConvBNAct(channel * 3, channel, 3, 1, 1, act=True)
+
+    def forward(self, f1, f2, f3, f4):
+        # ===== Eq.(2): pairwise interaction =====
+        def pairwise(fa, fb):
+            fa_up = F.interpolate(fa, size=fb.shape[2:], mode="bilinear", align_corners=False)
+
+            Ei = (fa_up * fb).sum(dim=1, keepdim=True)
+            Ei = Ei.expand_as(fb)
+
+            return Ei
+
+        E1 = pairwise(f1, f2)
+        E2 = pairwise(f2, f3)
+        E3 = pairwise(f3, f4)
+
+        # ===== Eq.(3): spatial propagation =====
+        G1 = self.sp1(E1, f1, f2)
+        G2 = self.sp2(E2, f2, f3)
+        G3 = self.sp3(E3, f3, f4)
+
+        # multi-scale align
+        G2_up = F.interpolate(G2, size=G1.shape[2:], mode="bilinear", align_corners=False)
+        G3_up = F.interpolate(G3, size=G1.shape[2:], mode="bilinear", align_corners=False)
+
+        Pg = torch.cat([G1, G2_up, G3_up], dim=1)
+        Pg = self.out_conv(Pg)
+
+        return Pg
+
+class Net(nn.Module):
+    def __init__(self, channel=64, pretrained=None, backbone="smt_t"):
+        super().__init__()
+
+        if backbone == "smt_t":
+            self.smt = smt_t()
+        else:
+            self.smt = smt_s()
+
+        self.trans2 = ConvBNAct(128, channel, 1, 1, 0, act=False)
+        self.trans3 = ConvBNAct(256, channel, 1, 1, 0, act=False)
+        self.trans4 = ConvBNAct(512, channel, 1, 1, 0, act=False)
+
+        # ===== 新增 GID =====
+        self.gid = GID(channel)
+
+        # 用于融合 Pg
+        self.gid_fuse3 = ConvBNAct(channel * 2, channel, 3, 1, 1)
+        self.gid_fuse2 = ConvBNAct(channel * 2, channel, 3, 1, 1)
+        self.gid_fuse1 = ConvBNAct(channel * 2, channel, 3, 1, 1)
+
+        self.fuse34 = DiffGuidedFusion(channel)
+        self.fuse23 = DiffGuidedFusion(channel)
+        self.fuse12 = DiffGuidedFusion(channel)
+
+        self.boundary3 = BoundaryEnhancement(channel)
+        self.boundary2 = BoundaryEnhancement(channel)
+        self.boundary1 = BoundaryEnhancement(channel)
+
+        self.uncertainty2 = UncertaintyGuidance(channel)
+        self.uncertainty1 = UncertaintyGuidance(channel)
+
+        self.refine1 = ConvBNAct(channel, channel, 3, 1, 1)
+        self.refine2 = ConvBNAct(channel, channel, 3, 1, 1)
+        self.refine3 = ConvBNAct(channel, channel, 3, 1, 1)
+
+        self.semantic3 = SemanticContextBlock(channel)
+        self.semantic2 = SemanticContextBlock(channel)
+        self.semantic1 = SemanticContextBlock(channel)
+
+        self.boundary_ctx3 = BoundaryContextBlock(channel)
+        self.boundary_ctx2 = BoundaryContextBlock(channel)
+        self.boundary_ctx1 = BoundaryContextBlock(channel)
+
+        self.feedback2 = ConfidenceFeedbackRefiner(channel)
+        self.feedback1 = ConfidenceFeedbackRefiner(channel)
+
+        self.pred1 = nn.Conv2d(channel, 1, 3, padding=1)
+        self.pred2 = nn.Conv2d(channel, 1, 3, padding=1)
+        self.pred3 = nn.Conv2d(channel, 1, 3, padding=1)
+
+        self.logit_fusion = LogitFusionHead(in_channels=3, hidden=16)
+
+        if pretrained is not None:
+            self.load_pre(pretrained)
+
+    def forward(self, x):
+        input_size = x.shape[2:]
+
+        c1, c2, c3, c4 = self.smt(x)
+
+        c2 = self.trans2(c2)
+        c3 = self.trans3(c3)
+        c4 = self.trans4(c4)
+
+        # ===== GID 生成全局先验 Pg =====
+        Pg = self.gid(c1, c2, c3, c4)
+
+        # ===== stage 3 =====
+        p3 = self.fuse34(c3, c4)
+        Pg3 = F.interpolate(Pg, size=p3.shape[2:], mode="bilinear", align_corners=False)
+        p3 = self.gid_fuse3(torch.cat([p3, Pg3], dim=1))
+
+        p3 = self.refine3(p3)
+        p3 = self.boundary3(p3)
+        p3 = self.semantic3(p3)
+        p3 = self.boundary_ctx3(p3)
+        out3 = self.pred3(p3)
+
+        # ===== stage 2 =====
+        p2 = self.fuse23(c2, p3)
+        Pg2 = F.interpolate(Pg, size=p2.shape[2:], mode="bilinear", align_corners=False)
+        p2 = self.gid_fuse2(torch.cat([p2, Pg2], dim=1))
+
+        p2 = self.refine2(p2)
+        p2 = self.boundary2(p2)
+        p2 = self.semantic2(p2)
+        p2 = self.boundary_ctx2(p2)
+
+        p2 = self.uncertainty2(p2, out3)
+        p2, out3_refined = self.feedback2(p2, out3)
+        out2 = self.pred2(p2)
+
+        # ===== stage 1 =====
+        p1 = self.fuse12(c1, p2)
+        Pg1 = F.interpolate(Pg, size=p1.shape[2:], mode="bilinear", align_corners=False)
+        p1 = self.gid_fuse1(torch.cat([p1, Pg1], dim=1))
+
+        p1 = self.refine1(p1)
+        p1 = self.boundary1(p1)
+        p1 = self.semantic1(p1)
+        p1 = self.boundary_ctx1(p1)
+
+        p1 = self.uncertainty1(p1, out2)
+        p1, out2_refined = self.feedback1(p1, out2)
+        out1 = self.pred1(p1)
+
+        # ===== upsample =====
+        out1 = F.interpolate(out1, size=input_size, mode="bilinear", align_corners=False)
+        out2_refined = F.interpolate(out2_refined, size=input_size, mode="bilinear", align_corners=False)
+        out3_refined = F.interpolate(out3_refined, size=input_size, mode="bilinear", align_corners=False)
+
+        fused_logits = self.logit_fusion(out1, out2_refined, out3_refined)
+        out1 = out1 + fused_logits
+
+        return out1#, out2_refined, out3_refined
+
+    def load_pre(self, pre_model_r):
+        ckpt = torch.load(pre_model_r, map_location="cpu")
+
+        if isinstance(ckpt, dict):
+            if "model" in ckpt:
+                state_dict = ckpt["model"]
+            elif "state_dict" in ckpt:
+                state_dict = ckpt["state_dict"]
+            else:
+                state_dict = ckpt
+        else:
+            state_dict = ckpt
+
+        self.smt.load_state_dict(state_dict, strict=False)
+        print(f"SMT backbone loaded successfully from: {pre_model_r}")
+
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.randn(1, 3, 416, 416).to(device)
+
+    model = Net(channel=64, backbone="smt_t").to(device)
+    model.eval()
+
+    flops, params = profile(model, inputs=(x,), verbose=False)
+    print("flops: %.2f G, params: %.2f M" % (flops / 1e9, params / 1e6))
