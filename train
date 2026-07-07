@@ -1,0 +1,267 @@
+import os
+import torch
+import torch.nn.functional as F
+import sys
+
+from PIL import Image
+from torch import nn
+from torch.utils.data import DataLoader
+
+sys.path.append('./models')
+import numpy as np
+from datetime import datetime
+from torchvision.utils import make_grid
+from data_cod import get_loader, get_test_loader
+from utils import clip_gradient, adjust_lr
+from tensorboardX import SummaryWriter
+import logging
+import torch.backends.cudnn as cudnn
+import argparse
+
+
+from models.xrsy.Baseline_t import Net   ############################################################
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--epoch', type=int, default=200, help='epoch number')
+parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')  # 5e-5
+parser.add_argument('--batchsize', type=int, default=32, help='training batch size')
+parser.add_argument('--trainsize', type=int, default=416, help='training dataset size')
+parser.add_argument('--clip', type=float, default=0.5, help='gradient clipping margin')
+parser.add_argument('--decay_rate', type=float, default=0.1, help='decay rate of learning rate')
+parser.add_argument('--decay_epoch', type=int, default=100, help='every n epochs decay learning rate')  # 100
+parser.add_argument('--load', type=str, default='./weights/smt_tiny.pth', help='train from checkpoints')#############################################
+parser.add_argument('--gpu_id', type=str, default='0', help='train use gpu')
+parser.add_argument('--rgb_root', type=str, default='/home/Documents/FR/CODdatasets/train-COD10K+CAMO-TR/Image/', help='the training rgb images root')
+parser.add_argument('--gt_root', type=str, default='/home/Documents/FR/CODdatasets/train-COD10K+CAMO-TR/GT/', help='the training gt images root')
+parser.add_argument('--edge_root', type=str, default='/home/Documents/FR/CODdatasets/train-COD10K+CAMO-TR/Edge/', help='the training gt images root')
+# parser.add_argument('--edge_root', type=str, default='./DUTS-TR/DUTS-TR-Edge/', help='the training gt images root')
+
+parser.add_argument('--test_rgb_root', type=str, default='/home/Documents/FR/CODdatasets/test/Image/', help='the test gt images root')
+parser.add_argument('--test_gt_root', type=str, default='/home/Documents/FR/CODdatasets/test/GT/', help='the test gt images root')
+parser.add_argument('--save_path', type=str, default='./run/Baseline_t/', help='the path to save models and logs')      ################################################
+
+opt = parser.parse_args()
+
+
+def iou_loss(pred, mask):
+    pred  = torch.sigmoid(pred)
+    inter = (pred*mask).sum(dim=(2,3))
+    union = (pred+mask).sum(dim=(2,3))
+    iou  = 1-(inter+1)/(union-inter+1)
+    return iou.mean()
+
+
+if opt.gpu_id == '0':
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    print('USE GPU 0')
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_id
+    print(f'USE GPU {opt.gpu_id}')
+cudnn.benchmark = True
+image_root = opt.rgb_root
+gt_root = opt.gt_root
+edge_root = opt.edge_root
+
+
+test_image_root = opt.test_rgb_root
+test_gt_root = opt.test_gt_root
+save_path = opt.save_path
+os.makedirs(save_path, exist_ok=True)
+
+logging.basicConfig(filename=save_path + 'Net.log',
+                    format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]', level=logging.INFO, filemode='a',
+                    datefmt='%Y-%m-%d %I:%M:%S %p')
+logging.info("Net-Train_4_pairs")
+
+model = Net()
+
+num_parms = 0
+if (opt.load is not None):
+    model.load_pre(opt.load)
+    print('load model from ', opt.load)
+
+
+for p in model.parameters():
+    num_parms += p.numel()
+logging.info("Total Parameters (For Reference): {}".format(num_parms))
+print("Total Parameters (For Reference): {}".format(num_parms))
+
+params = model.parameters()
+optimizer = torch.optim.Adam(params, opt.lr)
+
+# set the path
+
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+
+# load data
+print('load data...')
+train_loader = get_loader(image_root, gt_root, edge_root, batchsize=opt.batchsize, trainsize=opt.trainsize)
+test_loader = get_test_loader(test_image_root, test_gt_root, batchsize=opt.batchsize, testsize=opt.trainsize)
+
+total_step = len(train_loader)
+
+logging.info("Config")
+logging.info(
+    'epoch:{};lr:{};batchsize:{};trainsize:{};clip:{};decay_rate:{};load:{};save_path:{};decay_epoch:{}'.format(
+        opt.epoch, opt.lr, opt.batchsize, opt.trainsize, opt.clip, opt.decay_rate, opt.load, save_path,
+        opt.decay_epoch))
+
+# set loss function
+CE = torch.nn.BCEWithLogitsLoss()
+ECE = torch.nn.BCELoss()
+step = 0
+writer = SummaryWriter(save_path + 'summary')
+best_mae = 1
+best_epoch = 0
+
+def dice_loss(predict, target):
+    smooth = 1
+    p = 2
+    valid_mask = torch.ones_like(target)
+    predict = predict.contiguous().view(predict.shape[0], -1)
+    target = target.contiguous().view(target.shape[0], -1)
+    valid_mask = valid_mask.contiguous().view(valid_mask.shape[0], -1)
+    num = torch.sum(torch.mul(predict, target) * valid_mask, dim=1) * 2 + smooth
+    den = torch.sum((predict.pow(p) + target.pow(p)) * valid_mask, dim=1) + smooth
+    loss = 1 - num / den
+    return loss.mean()
+
+def train(train_loader, model, optimizer, epoch, save_path):
+    global step
+    model.cuda()
+    model.train()
+
+    loss_all = 0
+    epoch_step = 0
+
+    try:
+        for i, (images, gts, edges) in enumerate(train_loader, start=1):
+            optimizer.zero_grad()
+
+            images = images.cuda()
+            gts = gts.cuda()
+            edges = edges.cuda()
+
+            # --- 核心修改：使用 autocast 开启混合精度 ---
+            with torch.cuda.amp.autocast():
+                s1 = model(images)
+                bce_iou1 = CE(s1, gts) + iou_loss(s1, gts)
+                #bce_iou2 = CE(s2, gts) + iou_loss(s2, gts)
+                #bce_iou3 = CE(s3, gts) + iou_loss(s3, gts)
+                #bce_iou4 = CE(s4, gts) + iou_loss(s4, gts)
+
+                loss = bce_iou1# + bce_iou2 + bce_iou3 + bce_iou4 * 0.5
+
+            # --- 核心修改：使用 scaler 进行反向传播 ---
+            scaler.scale(loss).backward()
+
+            # 先 unscale 梯度，才能进行梯度裁剪
+            scaler.unscale_(optimizer)
+            clip_gradient(optimizer, opt.clip)
+
+            # scaler.step() 替代 optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+            # ---------------------------------------
+
+            step += 1
+            epoch_step += 1
+            loss_all += loss.detach().item()
+            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            if i % 100 == 0 or i == total_step or i == 1:
+                print('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], LR:{:.7f}||sal_loss:{:4f} '.
+                      format(datetime.now(), epoch, opt.epoch, i, total_step,
+                             optimizer.state_dict()['param_groups'][0]['lr'], loss.detach()))
+                logging.info(
+                    '#TRAIN#:Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], LR:{:.7f},  sal_loss:{:4f} , mem_use:{:.0f}MB'.
+                        format(epoch, opt.epoch, i, total_step, optimizer.state_dict()['param_groups'][0]['lr'], loss.detach(),memory_used))
+                writer.add_scalar('Loss', loss.detach(), global_step=step)
+                grid_image = make_grid(images[0].clone().cpu().detach(), 1, normalize=True)
+                writer.add_image('RGB', grid_image, step)
+                grid_image = make_grid(gts[0].clone().cpu().detach(), 1, normalize=True)
+                writer.add_image('Ground_truth', grid_image, step)
+                res = s1[0].clone()
+                res = res.sigmoid().detach().cpu().numpy().squeeze()
+                res = (res - res.min()) / (res.max() - res.min() + 1e-8)
+                writer.add_image('res', torch.tensor(res), step, dataformats='HW')
+        loss_all /= epoch_step
+        logging.info('#TRAIN#:Epoch [{:03d}/{:03d}],Loss_AVG: {:.4f}'.format(epoch, opt.epoch, loss_all))
+        writer.add_scalar('Loss-epoch', loss_all, global_step=epoch)
+        if epoch > 195:
+            torch.save(model.state_dict(), save_path + 'Net_epoch_{}.pth'.format(epoch))
+    except KeyboardInterrupt:
+        print('Keyboard Interrupt: save model and exit.')
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        torch.save(model.state_dict(), save_path + 'Net_epoch_{}.pth'.format(epoch + 1))
+        print('save checkpoints successfully!')
+        raise
+def bce2d_new(input, target, reduction=None):
+    assert (input.size() == target.size())
+    pos = torch.eq(target, 1).float()
+    neg = torch.eq(target, 0).float()
+
+    num_pos = torch.sum(pos)
+    num_neg = torch.sum(neg)
+    num_total = num_pos + num_neg
+
+    alpha = num_neg / num_total
+    beta = 1.1 * num_pos / num_total
+    weights = alpha * pos + beta * neg
+
+    return F.binary_cross_entropy_with_logits(input, target, weights, reduction=reduction)
+
+
+def test(test_loader, model, epoch, save_path):
+    global best_mae, best_epoch
+    model.eval()
+    with torch.no_grad():
+        # 推理时也开启 autocast
+        with torch.cuda.amp.autocast():
+            mae_sum = 0.0
+            total_num = 0
+            for i, (images, gt_paths, names) in enumerate(test_loader):
+                images = images.cuda()
+                res = model(images)
+
+                for j in range(images.size(0)):
+                    gt = Image.open(gt_paths[j]).convert('L')
+
+                    gt = np.asarray(gt, np.float32)
+                    gt /= (gt.max() + 1e-8)
+
+                    res_j = res[j].unsqueeze(0)
+                    res_j = nn.functional.interpolate(res_j, size=gt.shape, mode='bilinear', align_corners=False)
+                    res_j = res_j.sigmoid().detach().cpu().numpy().squeeze()
+                    res_j = (res_j - res_j.min()) / (res_j.max() - res_j.min() + 1e-8)
+
+                    mae_sum += np.sum(np.abs(res_j - gt)) * 1.0 / (gt.shape[0] * gt.shape[1])
+                    total_num += 1
+
+        # 计算整个测试集的平均 MAE
+        mae = mae_sum / total_num
+        writer.add_scalar('MAE', mae, global_step=epoch)
+        print('Epoch: {} MAE: {} ####  bestMAE: {} bestEpoch: {}'.format(epoch, mae, best_mae, best_epoch))
+
+        if epoch == 1:
+            best_mae = mae
+            best_epoch = epoch
+        else:
+            if mae < best_mae:
+                best_mae = mae
+                best_epoch = epoch
+                torch.save(model.state_dict(), save_path + 'Net_epoch_best.pth')
+                print('best epoch:{}'.format(epoch))
+        logging.info('#TEST#:Epoch:{} MAE:{} bestEpoch:{} bestMAE:{}'.format(epoch, mae, best_epoch, best_mae))
+
+if __name__ == '__main__':
+    print("Start train...")
+    for epoch in range(1, opt.epoch):
+        scaler = torch.cuda.amp.GradScaler()
+        cur_lr = adjust_lr(optimizer, opt.lr, epoch, opt.decay_rate, opt.decay_epoch)
+        writer.add_scalar('learning_rate', cur_lr, global_step=epoch)
+        train(train_loader, model, optimizer, epoch, save_path)
+        test(test_loader, model, epoch, save_path)
+        # if epoch > 100:
+        #     test(test_loader, model, epoch, save_path)
