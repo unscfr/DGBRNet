@@ -263,7 +263,7 @@ class ConfidenceFeedbackRefiner(nn.Module):
         super().__init__()
 
         self.guide_encoder = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1, bias=False),
+            nn.Conv2d(4, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.SiLU(inplace=True),
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
@@ -302,7 +302,7 @@ class ConfidenceFeedbackRefiner(nn.Module):
         boundary_hint = torch.abs(prob - self.avg_pool(prob))
         boundary_hint = torch.clamp(boundary_hint, 0.0, 1.0)
 
-        guide = torch.cat([confidence, uncertainty, boundary_hint], dim=1)
+        guide = torch.cat([confidence, uncertainty, boundary_hint, entropy], dim=1)
         guide_feat = self.guide_encoder(guide)
 
         gate = self.gate(torch.cat([feat, guide_feat], dim=1))
